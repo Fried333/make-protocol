@@ -223,7 +223,7 @@ a `loan.match` for any request that meets the offer's criteria
 Reference client (`make-gui`) runs the watcher inside the lender's
 browser; the wallet stays unlocked and signs locally — no key custody.
 Auto-fund is opt-in client behavior, not a protocol-level guarantee:
-indexers and indexers and history aggregators MUST treat auto-funded matches
+indexers and history aggregators MUST treat auto-funded matches
 identically to manually-posted ones.
 
 ### `contract.loan.request` — borrower posts a specific request

@@ -15,6 +15,7 @@ No smart-contract bytecode. No arbiter. No oracle. No liquidation bot. Just pre-
 - [What's in this repo](#whats-in-this-repo)
 - [Reference clients](#reference-clients)
 - [Status](#status)
+- [Indexer trust boundary](#indexer-trust-boundary)
 - [Architecture summary](#architecture-summary)
 - [Use cases](#use-cases)
 - [What it is NOT for](#what-it-is-not-for)
@@ -47,7 +48,7 @@ e.g. `make.vrsc::contract.loan.offer`, `make.vrsc::contract.option.exercise`. Se
 
 ## How it runs
 
-Just a Verus daemon. Your daemon is mempool-aware (`getidentity <iaddr> -1`), P2P propagates between counterparties in ~5s, no 3rd-party RPC required for active-loan ops. A public block explorer (e.g. [scan.verus.cx](https://scan.verus.cx)) is a convenience for stranger-discovery — browsing offers from parties you haven't met yet — but not load-bearing for any active loan, repay, settle, or recovery flow.
+Just a Verus daemon. Your daemon is mempool-aware (`getidentity <iaddr> -1`), P2P propagates between known counterparties in ~5s, no 3rd-party RPC required for active-loan ops. A public block explorer or indexer (e.g. [scan.verus.cx](https://scan.verus.cx)) is a convenience for stranger-discovery — browsing offers from parties you have not met yet — but not load-bearing for any active loan, repay, settle, or recovery flow.
 
 Trade history is chain-derived: past `loan.history` attestations name counterparties, so a settled loan shows up on both parties' history views regardless of which one wrote the attestation. No central scorer, no GUI dependency.
 
@@ -106,6 +107,16 @@ The same primitive (SIGHASH_SINGLE|ANYONECANPAY pre-commit) supports multiple us
 | Front-run protection (no offer ever in mempool) | ✅ structural |
 
 See [TESTING.md](./TESTING.md) for txid references and [SCENARIOS.md](./SCENARIOS.md) for the full scenario test matrix.
+
+## Indexer trust boundary
+
+Explorers and indexers are allowed to accelerate discovery, but they are not protocol authorities.
+
+- **Indexer/discovery layer:** global marketplace browse, search, filtering, and public links may use `scan.verus.cx` or any competing indexer.
+- **Protocol/truth layer:** before signing, accepting, repaying, claiming, or writing settlement history, a wallet must rebuild the relevant payloads from the local daemon: `getidentity`, `getidentityhistory`, `getrawtransaction`, and the original VerusID `contentmultimap`.
+- **Failure mode:** if an indexer is down, stale, or malicious, users may miss or mis-see offers. It must not be able to cause a bad signature, bad accept, bad repayment, or unrecoverable state.
+
+The reference GUI follows this boundary for the v3 loan flow: scan is optional and disabled unless configured, v2 accept re-fetches the request from daemon/contentmultimap before signing, lender history attestation rebuilds request terms from the original request transaction, and legacy scan-backed v1 accept is disabled.
 
 ## Architecture summary
 

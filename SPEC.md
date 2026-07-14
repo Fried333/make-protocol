@@ -56,7 +56,7 @@ A peer-to-peer collateralized credit protocol composed entirely from existing Ve
 - Time-based default with no live cooperation required
 - Reorg-safe by construction (pre-signed txs don't depend on chain state)
 - Survives single-party key loss (rescue path)
-- Marketplace, trade history, and ceremony all on chain (no off-chain server required)
+- Marketplace, trade history, and ceremony state all on chain; global browse UX may use optional indexes, but signing and settlement verify against local daemon data
 - Works with existing Verus primitives — no new RPCs or consensus rules
 
 ### Non-goals
@@ -474,7 +474,9 @@ The only adversarial reorg the protocol can't defend against is a deep (>10-bloc
 
 ## 9. Marketplace via contentmultimap
 
-The contentmultimap of a VerusID functions as a chain-native marketplace data layer. **No separate server, API, or centralized index is required.** Anyone with a Verus node can discover loan offers via the standard `getidentity` RPC.
+The contentmultimap of a VerusID functions as a chain-native marketplace data layer. If you know the relevant VerusID, no separate server, API, or centralized index is required: any Verus node can read that identity's offers, requests, matches, status, and history via standard daemon RPCs.
+
+Global stranger-discovery is a separate indexing problem. A normal daemon can answer "what is on this identity?" but not "which identities on chain currently have a `loan.offer` entry?" without walking an impractically large search space. Wallets may use explorers, public indexers, parent-ID conventions, local self-indexers, or explicit watchlists for discovery. Those systems are indexes only; they are not protocol truth.
 
 ### Validated end-to-end: §33
 
@@ -523,7 +525,7 @@ Each is a hex-encoded JSON payload under a canonical VDXF key. Wallets write to 
 }
 ```
 
-### What an explorer or wallet can show
+### What an explorer, indexer, or wallet can show
 
 A page like `/lending/offers` queries known VerusIDs (or a filtered subset) for `make.vrsc::contract.loan.offer` entries and renders:
 
@@ -534,15 +536,25 @@ A page like `/lending/offers` queries known VerusIDs (or a filtered subset) for 
 
 Track record is computed from each lender's `make.vrsc::contract.loan.history` entries (§10).
 
-### Discovery scaling
+### Discovery scaling and trust boundary
 
-Three plausible patterns:
+Several plausible patterns:
 
 - **A — Walk all VerusIDs.** Doesn't scale; not recommended.
 - **B — Convention: register under a known parent.** Lenders register `<random>.lend@` sub-IDs per offer. Browsers query just that parent's children. Bounded set.
 - **C — Hybrid: explorers index the chain.** Convention defines schema; explorers maintain caches. Multiple competing explorers possible.
+- **D — Local self-indexer.** A user or wallet runs its own index over identity updates and builds a local searchable database.
+- **E — Watchlists.** A wallet polls known counterparties and counterparties recovered from its own identity history.
 
-The spec defines the schema but does not mandate a discovery mechanism. **Pattern C is the practical default** — any explorer can index, none is canonical.
+The spec defines the schema but does not mandate a discovery mechanism. **Pattern C is the practical default for global browse UX** — any explorer can index, none is canonical.
+
+Before any wallet signs, accepts, repays, claims, or posts settlement history, it must re-read and verify the canonical data from the local daemon / chain:
+
+- `loan.request` terms from the request transaction's `contentmultimap`
+- `loan.match` bytes from the lender's current or historical VerusID multimap
+- settlement state from `loan.status`, `loan.history`, vault-spend txs, and `getidentityhistory`
+
+An indexer may make discovery stale or incomplete. It must not be able to change the terms a wallet signs for or the settlement path a wallet executes.
 
 ---
 

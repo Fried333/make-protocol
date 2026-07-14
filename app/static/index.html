@@ -44,6 +44,10 @@
         <button data-mp-tab="history"  class="mp-tab" title="Settled or defaulted loans">History <span class="count" id="ct-history">·</span></button>
         <button data-mp-tab="market"   class="mp-tab" title="Browse all open offers from other parties — find a counterparty">Marketplace <span class="count" id="ct-market">·</span></button>
         <span style="flex:1"></span>
+        <label style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted);margin:0;cursor:pointer" title="Allows automatic accept and lender history writes to run in the background">
+          <input type="checkbox" id="mp-background-writes" style="margin:0">
+          Background writes
+        </label>
         <label style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted);margin:0;cursor:pointer" title="Hides entries past their valid_until_block / expires_block, and entries posted &gt; 7 days ago without an explicit expiry">
           <input type="checkbox" id="mp-show-stale" style="margin:0">
           Show stale

@@ -758,7 +758,7 @@ Setup: same vault `i6ebrehQ6dyJGjy8LoxkaPfJ2Vo7dXGbHy` (2-of-2 [Alice, Bob], nul
 
 ### 33. Marketplace data layer — loan offer published & cross-node readable
 
-Demonstrates that the **chain itself is the marketplace**. A loan offer is a `loan.offer.v1` entry in a VerusID's contentmultimap. Anyone with a Verus node can read it via `getidentity` — no server, no API, no centralized index needed.
+Demonstrates that the **chain itself is the canonical marketplace data layer**. A loan offer is a `loan.offer.v1` entry in a VerusID's contentmultimap. Anyone with a Verus node can read that known VerusID via `getidentity`; no server, API, or centralized index is needed to verify the offer once the identity is known.
 
 **Setup:**
 - VDXF key for `loan.offer.v1`: `iDDdeciNHuSiggfZrquEBJAX5TUxkm2Sgy` (generated via `getvdxfid "loan.offer.v1"`; namespace defaults to VRSC chain)
@@ -791,16 +791,16 @@ Demonstrates that the **chain itself is the marketplace**. A loan offer is a `lo
 
 **Validates:**
 - ✅ The contentmultimap is the marketplace data layer — no separate server required
-- ✅ Anyone with a Verus node can discover offers via `getidentity`
+- ✅ Anyone with a Verus node can read offers from a known VerusID via `getidentity`
 - ✅ VDXF keys provide canonical schema addressing (anyone computing `getvdxfid "loan.offer.v1"` gets the same key)
 - ✅ Hex-encoded JSON in the multimap entry is the simplest viable encoding
 - ✅ Offers are public, queryable, censorship-resistant
 
 **What this means architecturally:**
 
-The protocol doesn't need a marketplace operator. The **explorer's role is rendering, not gatekeeping** — every wallet can implement its own discovery/filtering on top of the same chain data. Any explorer, marketplace, or wallet can show the same set of offers because they're all reading from the same chain.
+The protocol doesn't need a marketplace operator for custody, matching, or settlement. The **explorer's role is indexing/rendering, not gatekeeping** — every wallet can implement its own discovery/filtering on top of the same chain data. Any explorer, marketplace, or wallet can show equivalent offers if it indexes the same VerusID updates and schema keys.
 
-Combined with §13 (trade history) and §13.1 (encrypted multimap), the protocol's full lifecycle — discovery, ceremony coordination, settlement, trade history — runs entirely on chain. No off-chain infrastructure required.
+Combined with §13 (trade history) and §13.1 (encrypted multimap), the protocol's load-bearing lifecycle — ceremony coordination, settlement, recovery, and trade history — is rebuildable from chain data. Global stranger-discovery is still an indexing problem; indexers improve browse UX but must not be protocol authorities.
 
 ### 34. Cross-currency `makeoffer`/`takeoffer` validated for pure-CLI atomic swap
 
@@ -998,3 +998,58 @@ Validates the marketplace UX flow where a lender publicly declines a borrower's 
 - Same retention pattern as `loan.history` — live multimap holds the latest decline as a beacon; older entries persist in past identity revisions.
 
 **Implication for SCHEMA:** the existing `loan.template` "encrypted (self)" backup primitive (§37 marked as unused) can be formally deprecated. All settlement data is recoverable from past identity revisions (proven by §38 chain-only recovery scenario).
+
+### 41. GUI daemon-first regression and indexer trust boundary
+
+Validates that the current GUI treats `scan.verus.cx` as an indexer for
+discovery/display only, not as a protocol authority for signing or
+settlement.
+
+**Setup:** borrower `3965555_108of200.vlotto@`
+(`i44CxABWkVnUhoPMjuM2ViJDDu2icd7jg7`) and lender
+`3965555_101of200.vlotto@`
+(`i7b7Tq8JYXX9iqS7FBevC6LaG3ioh8z3RM`) in one local daemon. External
+explorer API disabled with empty `localStorage.vl_explorer_api`.
+
+**Regression run:**
+
+- Borrower posts directed auto-accept request.
+- Lender sees request from local daemon/watchlist, funds it, and posts
+  `loan.match`.
+- Borrower's background watcher opens the match panel and executes v2
+  accept.
+- v2 accept re-fetches the original request from the request transaction's
+  `contentmultimap` before signing or posting `loan.status`.
+- Borrower repays; borrower `loan.status` is removed and borrower
+  `loan.history(outcome=repaid)` is posted.
+- After Tx-Repay confirms, lender background watcher reconstructs the
+  original request terms from the same request transaction, classifies the
+  vault spend, posts lender `loan.history(outcome=repaid)`, and removes the
+  settled lender `loan.match`.
+
+**Txids:**
+
+- Request: `6c3248794b6748f249045547e5bf67b42e88e8b86e46e225661405846270cf14`
+- Tx-A / loan id: `e90958b6d2e875189cafb7256c8a41cd72399773dda866091261a2e9d37d48ec`
+- Tx-Repay: `075463ff367f698b0914d53f262bc5dea6a542c9c8df4ff506b21b00c32f5309`
+
+**Local rebuild checks:**
+
+- Browser `localStorage` cleared, app reloaded, Marketplace count rebuilt
+  from daemon-known data with scan disabled.
+- `~/.verus_contract_gui/history_cache.json` deleted; History tab rebuilt
+  settled rows from `getidentityhistory` and recreated the cache.
+- App reloaded again; History rendered from the rebuilt cache and reconciled
+  with daemon state.
+
+**Security / trust-boundary result:**
+
+- `scan.verus.cx` can be used to discover or display offers, requests, and
+  matches when configured.
+- Before v2 accept, the GUI must use daemon/contentmultimap data. If it
+  cannot resolve the canonical request locally, accept aborts.
+- Legacy v1 accept is disabled in the GUI because it could use
+  scan-derived request terms to build a transaction.
+- Final chain state after the run: borrower `loan.request=0`,
+  `loan.status=0`, `loan.history=1`; lender `loan.offer=1`,
+  `loan.match=0`, `loan.history=1`.

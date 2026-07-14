@@ -13,428 +13,50 @@
 //     (Phase C will wire those up).
 
 import { rpc, ping } from "./rpc.js";
+import { _bytesToHex, _hexToBytes } from "./core/encoding.js";
+import { escapeHtml } from "./core/dom.js";
+import { formatAmount } from "./core/format.js";
+import {
+  dropMultimapKey,
+  encodeJsonToHex,
+  isHexString,
+  normalizeContentMultimap,
+  setMultimapEntries,
+} from "./core/multimap.js";
+import {
+  _balanceForCurrency,
+  CURRENCIES,
+  CURRENCY_NAME_TO_IADDR,
+  currencyOptions,
+  fmtBalances,
+} from "./services/currency-service.js";
+import {
+  decodeMultimapEntry,
+  VDXF,
+  VDXF_LOAN_DECLINE,
+  VDXF_LOAN_DECLINE_KEYS,
+  VDXF_LOAN_HISTORY,
+  VDXF_LOAN_HISTORY_KEYS,
+  VDXF_LOAN_MATCH,
+  VDXF_LOAN_MATCH_KEYS,
+  VDXF_LOAN_OFFER,
+  VDXF_LOAN_OFFER_KEYS,
+  VDXF_LOAN_REQUEST,
+  VDXF_LOAN_REQUEST_KEYS,
+  VDXF_LOAN_STATUS,
+  VDXF_LOAN_STATUS_KEYS,
+} from "./protocols/loans/loan-schema.js";
+import {
+  buildAndSignBorrowerTxA,
+  fetchRequestFromLocalDaemon,
+  getPubkeyForRAddress,
+  prependLenderInput,
+} from "./protocols/loans/loan-tx.js";
+import { _addrToP2pkhSpk } from "./tx/address-codec.js";
+import { _parseTx, _serializeTx } from "./tx/tx-codec.js";
 
-const EXPLORER_API = "https://scan.verus.cx/api";
-
-// Common Verus currencies (full canonical names). Used for dropdowns + toggles.
-const CURRENCIES = [
-  "VRSC",
-  "DAI.vETH",
-  "vETH",
-  "MKR.vETH",
-  "vUSDC.vETH",
-  "vUSDT.vETH",
-  "LINK.vETH",
-  "tBTC.vETH",
-  "EURC.vETH",
-  "vARRR",
-  "vDEX",
-  "CHIPS",
-];
-
-function currencyOptions(selected = "VRSC") {
-  return CURRENCIES.map((c) => `<option value="${c}"${c === selected ? " selected" : ""}>${c}</option>`).join("");
-}
-
-// Canonical VDXF keys, all under the registered standard owner make.VRSC@
-// (iLWvRsiWVCEuFYhCSt2Qba7LxWksrgVerX). Names: make.vrsc::contract.<slug>.
-// Earlier draft namespaces (`vrsc::contract.*`, `vcs::contract.*`) that
-// exist on chain are deliberately NOT supported — pre-release test data
-// only, no live users.
-const VDXF_LOAN_OFFER    = "iMey7Y2idT6dt7jJvRiPXgtYcfAaKCQbHz"; // make.vrsc::contract.loan.offer
-const VDXF_LOAN_REQUEST  = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5"; // make.vrsc::contract.loan.request
-const VDXF_LOAN_MATCH    = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U"; // make.vrsc::contract.loan.match
-const VDXF_LOAN_STATUS   = "iRzM96sNYj95mUiJebzBnFwirjfws2q6o4"; // make.vrsc::contract.loan.status
-const VDXF_LOAN_HISTORY  = "i5qBwi3KWXfyo1UKuUBC3yyq67JagVennW"; // make.vrsc::contract.loan.history
-const VDXF_LOAN_DECLINE  = "iEgciB3u2GwTxzShQR4eFhtj4k8Zv6frNb"; // make.vrsc::contract.loan.decline
-const VDXF_OPTION_OFFER  = "i5L8vkz9xsnM8yEDiXzPbP4Kix3SnJSsv5"; // make.vrsc::contract.option.offer
-
-// All read paths use these single-element arrays (kept for code shape so
-// the *_KEYS pattern is unchanged when adding legacy tiers later, if ever).
-const VDXF_LOAN_OFFER_KEYS   = [VDXF_LOAN_OFFER];
-const VDXF_LOAN_REQUEST_KEYS = [VDXF_LOAN_REQUEST];
-const VDXF_LOAN_MATCH_KEYS   = [VDXF_LOAN_MATCH];
-const VDXF_LOAN_STATUS_KEYS  = [VDXF_LOAN_STATUS];
-const VDXF_LOAN_HISTORY_KEYS = [VDXF_LOAN_HISTORY];
-const VDXF_LOAN_DECLINE_KEYS = [VDXF_LOAN_DECLINE];
-
-const VDXF = {
-  [VDXF_LOAN_OFFER]:    { slug: "loan.offer",    label: "Loan offer" },
-  [VDXF_LOAN_REQUEST]:  { slug: "loan.request",  label: "Loan request" },
-  [VDXF_LOAN_MATCH]:    { slug: "loan.match",    label: "Loan match" },
-  [VDXF_LOAN_STATUS]:   { slug: "loan.status",   label: "Loan active" },
-  [VDXF_LOAN_HISTORY]:  { slug: "loan.history",  label: "Loan settled" },
-  [VDXF_LOAN_DECLINE]:  { slug: "loan.decline",  label: "Loan declined" },
-  [VDXF_OPTION_OFFER]:  { slug: "option.offer",  label: "Option offer" },
-};
-
-// ---------- helpers ----------
-
-function decodeMultimapEntry(entry) {
-  let hex;
-  if (typeof entry === "string") hex = entry;
-  else if (entry?.serializedhex) hex = entry.serializedhex;
-  else if (entry?.message) hex = entry.message;
-  if (!hex || !/^[0-9a-fA-F]+$/.test(hex)) return null;
-  try {
-    const bytes = new Uint8Array(hex.match(/.{2}/g).map((b) => parseInt(b, 16)));
-    return JSON.parse(new TextDecoder().decode(bytes));
-  } catch {
-    return null;
-  }
-}
-
-// ---------- Sapling tx parser/serializer for extending pre-signed partials ----------
-// Borrower-side: take the lender's SIGHASH_SINGLE|ANYONECANPAY-signed Tx-A,
-// add the borrower's collateral input + vault P2SH output + change output,
-// without touching the lender's input 0 or output 0. Direct port of
-// helpers/extend_tx.py — see TESTING.md §25 for the validated pattern.
-
-function _hexToBytes(h) {
-  const out = new Uint8Array(h.length / 2);
-  for (let i = 0; i < h.length; i += 2) out[i / 2] = parseInt(h.slice(i, i + 2), 16);
-  return out;
-}
-function _bytesToHex(b) {
-  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
-}
-function _readVarint(b, off) {
-  const v = b[off];
-  if (v < 0xfd) return [v, off + 1];
-  if (v === 0xfd) return [b[off + 1] | (b[off + 2] << 8), off + 3];
-  if (v === 0xfe) return [(b[off + 1] | (b[off + 2] << 8) | (b[off + 3] << 16) | (b[off + 4] << 24)) >>> 0, off + 5];
-  // 64-bit varint — JS bitwise can't handle. Use BigInt.
-  let n = 0n;
-  for (let i = 0; i < 8; i++) n |= BigInt(b[off + 1 + i]) << BigInt(8 * i);
-  return [Number(n), off + 9];
-}
-function _writeVarint(n) {
-  if (n < 0xfd) return new Uint8Array([n]);
-  if (n <= 0xffff) return new Uint8Array([0xfd, n & 0xff, (n >> 8) & 0xff]);
-  if (n <= 0xffffffff) {
-    return new Uint8Array([0xfe, n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff]);
-  }
-  const out = new Uint8Array(9); out[0] = 0xff;
-  let big = BigInt(n);
-  for (let i = 0; i < 8; i++) { out[1 + i] = Number(big & 0xffn); big >>= 8n; }
-  return out;
-}
-function _readU32(b, off) {
-  return (b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)) >>> 0;
-}
-function _writeU32(n) {
-  return new Uint8Array([n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff]);
-}
-function _readI64LE(b, off) {
-  let n = 0n;
-  for (let i = 0; i < 8; i++) n |= BigInt(b[off + i]) << BigInt(8 * i);
-  return n;
-}
-function _writeI64LE(n) {
-  const out = new Uint8Array(8);
-  let big = BigInt(n);
-  for (let i = 0; i < 8; i++) { out[i] = Number(big & 0xffn); big >>= 8n; }
-  return out;
-}
-function _parseTx(hex) {
-  const b = _hexToBytes(hex);
-  let off = 0;
-  const versionRaw = _readU32(b, off); off += 4;
-  const fOverwintered = (versionRaw >>> 31) & 1;
-  const nVersion = versionRaw & 0x7fffffff;
-  let nVersionGroupId = 0;
-  if (fOverwintered) { nVersionGroupId = _readU32(b, off); off += 4; }
-  let vinCount; [vinCount, off] = _readVarint(b, off);
-  const vins = [];
-  for (let i = 0; i < vinCount; i++) {
-    const prevTxid = b.slice(off, off + 32); off += 32;
-    const prevVout = _readU32(b, off); off += 4;
-    let ssLen; [ssLen, off] = _readVarint(b, off);
-    const scriptSig = b.slice(off, off + ssLen); off += ssLen;
-    const sequence = _readU32(b, off); off += 4;
-    vins.push({ prevTxid, prevVout, scriptSig, sequence });
-  }
-  let voutCount; [voutCount, off] = _readVarint(b, off);
-  const vouts = [];
-  for (let i = 0; i < voutCount; i++) {
-    const value = _readI64LE(b, off); off += 8;
-    let spkLen; [spkLen, off] = _readVarint(b, off);
-    const scriptPubKey = b.slice(off, off + spkLen); off += spkLen;
-    vouts.push({ value, scriptPubKey });
-  }
-  const nLockTime = _readU32(b, off); off += 4;
-  let nExpiryHeight = 0;
-  if (fOverwintered) { nExpiryHeight = _readU32(b, off); off += 4; }
-  const remainder = b.slice(off);
-  return { fOverwintered, nVersion, nVersionGroupId, vins, vouts, nLockTime, nExpiryHeight, remainder };
-}
-function _serializeTx(tx) {
-  const parts = [];
-  const versionRaw = ((tx.nVersion & 0x7fffffff) | ((tx.fOverwintered & 1) << 31)) >>> 0;
-  parts.push(_writeU32(versionRaw));
-  if (tx.fOverwintered) parts.push(_writeU32(tx.nVersionGroupId));
-  parts.push(_writeVarint(tx.vins.length));
-  for (const v of tx.vins) {
-    parts.push(v.prevTxid);
-    parts.push(_writeU32(v.prevVout));
-    parts.push(_writeVarint(v.scriptSig.length));
-    parts.push(v.scriptSig);
-    parts.push(_writeU32(v.sequence));
-  }
-  parts.push(_writeVarint(tx.vouts.length));
-  for (const o of tx.vouts) {
-    parts.push(_writeI64LE(o.value));
-    parts.push(_writeVarint(o.scriptPubKey.length));
-    parts.push(o.scriptPubKey);
-  }
-  parts.push(_writeU32(tx.nLockTime));
-  if (tx.fOverwintered) parts.push(_writeU32(tx.nExpiryHeight));
-  parts.push(tx.remainder);
-  let total = 0; for (const p of parts) total += p.length;
-  const out = new Uint8Array(total);
-  let pos = 0;
-  for (const p of parts) { out.set(p, pos); pos += p.length; }
-  return _bytesToHex(out);
-}
-const _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-function _b58dec(s) {
-  let n = 0n;
-  for (const c of s) { const idx = _B58.indexOf(c); if (idx < 0) throw new Error("bad base58"); n = n * 58n + BigInt(idx); }
-  const bytes = [];
-  while (n > 0n) { bytes.unshift(Number(n & 0xffn)); n >>= 8n; }
-  let pad = 0;
-  for (const c of s) { if (c === "1") pad++; else break; }
-  return new Uint8Array([...new Array(pad).fill(0), ...bytes]);
-}
-function _addrToHash160(addr) {
-  const raw = _b58dec(addr);
-  if (raw.length !== 25) throw new Error(`expected 25 bytes for ${addr}, got ${raw.length}`);
-  return raw.slice(1, 21);
-}
-function _addrToP2pkhSpk(addr) {
-  const h = _addrToHash160(addr);
-  // OP_DUP OP_HASH160 push20 hash160 OP_EQUALVERIFY OP_CHECKSIG
-  return new Uint8Array([0x76, 0xa9, 0x14, ...h, 0x88, 0xac]);
-}
-function _addrToP2shSpk(addr) {
-  const h = _addrToHash160(addr);
-  // OP_HASH160 push20 hash160 OP_EQUAL
-  return new Uint8Array([0xa9, 0x14, ...h, 0x87]);
-}
-// Look up the compressed pubkey for an R-address by finding any prior tx
-// where it spent. For P2PKH inputs the scriptSig is `<sig> <pubkey>` —
-// the pubkey is the second push and is exactly 33 bytes (compressed).
-async function getPubkeyForRAddress(rAddr) {
-  // validateaddress is fast if the address is in the local wallet.
-  try {
-    const v = await rpc("validateaddress", [rAddr]);
-    if (v?.pubkey) return v.pubkey;
-  } catch {}
-  // Otherwise scan the address's tx history for a spending input.
-  let txids = [];
-  try {
-    txids = await rpc("getaddresstxids", [{ addresses: [rAddr] }]);
-  } catch { return null; }
-  for (let i = txids.length - 1; i >= 0; i--) {
-    try {
-      const tx = await rpc("getrawtransaction", [txids[i], 1]);
-      for (const vin of tx?.vin || []) {
-        const ssHex = vin?.scriptSig?.hex;
-        if (!ssHex) continue;
-        const inAddrs = vin?.addresses || [];
-        if (!inAddrs.includes(rAddr)) continue;
-        const bytes = _hexToBytes(ssHex);
-        let off = 0;
-        const sigLen = bytes[off]; off += 1 + sigLen;
-        if (off >= bytes.length) continue;
-        const pkLen = bytes[off]; off += 1;
-        if ((pkLen !== 33 && pkLen !== 65) || off + pkLen > bytes.length) continue;
-        return _bytesToHex(bytes.slice(off, off + pkLen));
-      }
-    } catch {}
-  }
-  return null;
-}
-
-// Pull a loan.request payload directly from the local daemon by reading the
-// originating tx and decoding the contentmultimap update. Used as a fallback
-// when scan.verus.cx is rate-limiting the explorer API.
-async function fetchRequestFromLocalDaemon(txid) {
-  const VDXF_LOAN_REQUEST = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5";
-  const tx = await rpc("getrawtransaction", [txid, 1]);
-  // The identity update is in tx.vout — find the one that has an identity
-  // primary output and pull the contentmultimap from its scriptPubKey.
-  for (const vout of tx?.vout || []) {
-    const cm = vout?.scriptPubKey?.identityprimary?.contentmultimap;
-    if (cm && cm[VDXF_LOAN_REQUEST]) {
-      const entry = cm[VDXF_LOAN_REQUEST][0];
-      const hex = typeof entry === "string" ? entry : entry?.serializedhex || entry?.message || "";
-      if (!hex) continue;
-      try {
-        const json = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
-        return { principal: json.principal, collateral: json.collateral, repay: json.repay, term_days: json.term_days };
-      } catch {}
-    }
-  }
-  return null;
-}
-
-// Borrower-first Tx-A skeleton builder: constructs Tx-A with borrower's
-// collateral input + 3 outputs (principal → borrower, collateral → vault,
-// change → borrower) and signs the borrower's input only with
-// SIGHASH_ALL|ANYONECANPAY. The lender at match time will add their input
-// (input 0) and sign theirs without invalidating the borrower's signature.
-async function buildAndSignBorrowerTxA({
-  borrowerInputTxid,
-  borrowerInputVout,
-  borrowerR,
-  principalCurrency,
-  principalAmount,
-  collateralCurrency,
-  collateralAmount,
-  vaultP2sh,
-  utxoAmount,    // optional — when caller already knows the UTXO size (e.g., just split it).
-                 //   Skips a getaddressutxos call (which doesn't see mempool).
-}) {
-  const FEE = 0.0001;
-  // Look up the borrower's input UTXO size to compute change — only if not provided.
-  if (utxoAmount === undefined) {
-    const utxos = await rpc("getaddressutxos", [{ addresses: [borrowerR], currencynames: true }]);
-    const u = utxos.find((x) => x.txid === borrowerInputTxid && x.outputIndex === borrowerInputVout);
-    if (!u) throw new Error(`UTXO ${borrowerInputTxid.slice(0, 16)}…:${borrowerInputVout} not found at ${borrowerR}`);
-    utxoAmount = collateralCurrency === "VRSC"
-      ? u.satoshis / 1e8
-      : parseFloat(u.currencyvalues?.[collateralCurrency] ?? 0);
-  }
-
-  // Resolve currency iaddrs for non-native principal/collateral
-  const ccyIaddr = async (name) => {
-    if (name === "VRSC") return "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV";
-    return (await rpc("getcurrency", [name]))?.currencyid;
-  };
-  const principalCcyId  = await ccyIaddr(principalCurrency);
-  const collateralCcyId = await ccyIaddr(collateralCurrency);
-  if (!principalCcyId || !collateralCcyId) throw new Error("could not resolve currency ids");
-
-  // Borrower's change in the collateral currency (from the same UTXO).
-  // Compare in integer satoshis to avoid float-precision bugs
-  // (0.5001 - 0.5 - 0.0001 ≈ -1e-17 in JS floats).
-  const utxoSats = Math.round(utxoAmount * 1e8);
-  const collateralSats = Math.round(collateralAmount * 1e8);
-  const feeSats = Math.round(FEE * 1e8);
-  const changeSats = utxoSats - collateralSats - feeSats;
-  if (changeSats < 0) throw new Error(`UTXO too small: have ${utxoSats} sats ${collateralCurrency}, need ${collateralSats + feeSats}`);
-  const change = changeSats / 1e8;
-
-  // Outputs: order matters because lender will SIGHASH_SINGLE|ANYONECANPAY
-  // input 0 → output 0 (principal). So output 0 = principal, output 1 = vault,
-  // output 2 = borrower's change.
-  // (Lender's input 0 is added later — we build with just borrower's input here.)
-  const principalOutputKey = borrowerR;
-  const principalOutputVal = principalCurrency === "VRSC"
-    ? principalAmount
-    : { [principalCcyId]: principalAmount };
-  const vaultOutputVal = collateralCurrency === "VRSC"
-    ? collateralAmount
-    : { [collateralCcyId]: collateralAmount };
-  const changeOutputVal = collateralCurrency === "VRSC"
-    ? change
-    : { [collateralCcyId]: change };
-
-  const tip = await rpc("getblockcount");
-  const expiryHeight = tip + 720; // ~12h
-  // For the placeholder Tx-A skeleton, we include only the borrower's input
-  // and the 3 outputs. The lender's input will be appended later.
-  const outputs = {};
-  outputs[principalOutputKey] = principalOutputVal;
-  outputs[vaultP2sh] = vaultOutputVal;
-  // Two outputs to borrowerR with different values would clash in the
-  // {address: amount} dict. Hack: use the address twice — but createrawtransaction
-  // dict can't represent two outputs to the same address. Workaround: route
-  // change to a different known borrower address, OR consolidate. For now,
-  // require change to go to borrowerR but raise if there's a clash.
-  if (principalOutputKey === borrowerR && change > 0) {
-    // We can't have two outputs to the same R-address via createrawtransaction's
-    // dict-based form. So we use sendmany-style serialization not directly
-    // supported. As a workaround, omit the change output and absorb it into
-    // a higher output. But that's wrong for amount.
-    // Cleanest fix: leave change for the lender to handle by overpaying fee,
-    // but that changes the contract. For now we hand-build the tx with the
-    // raw createrawtransaction "address" key supporting only one entry per
-    // address, so we accept that the borrower's change in collateral currency
-    // won't be sent to borrowerR if the principal also goes there.
-    // BUT — principal goes to borrower in PRINCIPAL currency, change goes
-    // back in COLLATERAL currency. They're DIFFERENT currencies, so the
-    // dict's {borrowerR: principalVal} doesn't conflict with {borrowerR: changeVal}
-    // unless principal and collateral are the same currency.
-    if (principalCurrency === collateralCurrency) {
-      throw new Error("principal and collateral cannot be the same currency in this builder yet");
-    }
-    // Different currencies: merge into one entry as a multi-currency map
-    outputs[borrowerR] = (typeof outputs[borrowerR] === "number")
-      ? { [principalCcyId]: outputs[borrowerR], [collateralCcyId]: change }
-      : { ...outputs[borrowerR], [collateralCcyId]: change };
-  } else if (change > 0) {
-    outputs[borrowerR] = changeOutputVal;
-  }
-
-  const unsignedHex = await rpc("createrawtransaction", [
-    [{ txid: borrowerInputTxid, vout: borrowerInputVout }],
-    outputs,
-    0,
-    expiryHeight,
-  ]);
-
-  // Sign the (only) input with SIGHASH_ALL|ANYONECANPAY
-  const signed = await rpc("signrawtransaction", [unsignedHex, null, null, "ALL|ANYONECANPAY"]);
-  if (!signed.complete) throw new Error("borrower signrawtransaction did not complete: " + JSON.stringify(signed.errors || {}));
-  return signed.hex;
-}
-
-// Lender-side: take the borrower's signed Tx-A skeleton (1 input, 3 outputs)
-// and prepend the lender's principal input as input 0 (with empty scriptSig
-// to be filled by signrawtransaction). Outputs are NOT touched — the
-// borrower locked them with SIGHASH_ALL|ANYONECANPAY. Borrower's signature
-// stays valid after their input shifts from index 0 to index 1 because the
-// SIGHASH hash doesn't include the input index.
-function prependLenderInput(borrowerSkeletonHex, lenderInputTxid, lenderInputVout) {
-  const tx = _parseTx(borrowerSkeletonHex);
-  if (tx.vins.length !== 1) throw new Error(`expected 1 input in borrower skeleton, got ${tx.vins.length}`);
-  if (tx.vouts.length < 2 || tx.vouts.length > 3) throw new Error(`expected 2 or 3 outputs in borrower skeleton, got ${tx.vouts.length}`);
-  const txidBytes = _hexToBytes(lenderInputTxid).reverse();
-  // Prepend (unshift) the lender's input as index 0
-  tx.vins.unshift({ prevTxid: txidBytes, prevVout: lenderInputVout, scriptSig: new Uint8Array(0), sequence: 0xffffffff });
-  return _serializeTx(tx);
-}
-
-function extendPresignedLoanTxA({ presignedHex, borrowerInputTxid, borrowerInputVout, vaultP2sh, collateralSats, borrowerChangeAddr, borrowerChangeSats }) {
-  const tx = _parseTx(presignedHex);
-  if (tx.vins.length !== 1 || tx.vouts.length !== 1) {
-    throw new Error(`expected pre-signed Tx-A with 1 input + 1 output, got ${tx.vins.length}/${tx.vouts.length}`);
-  }
-  // Append borrower input (empty scriptSig — to be signed by daemon)
-  const txidBytes = _hexToBytes(borrowerInputTxid).reverse(); // LE
-  tx.vins.push({ prevTxid: txidBytes, prevVout: borrowerInputVout, scriptSig: new Uint8Array(0), sequence: 0xffffffff });
-  // Append vault collateral output (P2SH)
-  tx.vouts.push({ value: BigInt(collateralSats), scriptPubKey: _addrToP2shSpk(vaultP2sh) });
-  // Append borrower change output (P2PKH)
-  tx.vouts.push({ value: BigInt(borrowerChangeSats), scriptPubKey: _addrToP2pkhSpk(borrowerChangeAddr) });
-  return _serializeTx(tx);
-}
-
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
-}
-
-function formatAmount(a) {
-  if (!a || typeof a !== "object") return "—";
-  // Chain-controlled (anyone with a VerusID can post arbitrary multimap
-  // entries), so always escape before returning — safe to inline into
-  // innerHTML at call sites.
-  return `${escapeHtml(a.amount ?? "?")} ${escapeHtml(a.currency ?? "")}`;
-}
+const LS_KEY_EXPLORER_API = "vl_explorer_api";
+const EXPLORER_API = (localStorage.getItem(LS_KEY_EXPLORER_API) || "").replace(/\/+$/, "");
 
 // ---------- header status ----------
 
@@ -602,14 +224,7 @@ document.getElementById("ids-list")?.addEventListener("click", async (ev) => {
       try {
         const info = await rpc("getidentity", [card.dataset.iaddr, -1]);
         const cm = info?.identity?.contentmultimap || {};
-        const newCm = {};
-        for (const [k, v] of Object.entries(cm)) {
-          if (k === vdxfId) continue; // drop this VDXF key
-          newCm[k] = (Array.isArray(v) ? v : [v]).map((entry) => {
-            if (typeof entry === "string") return entry;
-            return entry?.serializedhex || entry?.message || JSON.stringify(entry);
-          });
-        }
+        const newCm = dropMultimapKey(cm, vdxfId, { fallbackToJson: true });
         const updateArg = {
           name: card.dataset.name,
           parent: card.dataset.parent,
@@ -746,18 +361,8 @@ document.getElementById("ids-list")?.addEventListener("click", async (ev) => {
     const info = await rpc("getidentity", [iaddr, -1]);
     existing = info?.identity?.contentmultimap || {};
   } catch (e) { /* ignore */ }
-  const json = JSON.stringify(payload);
-  const hex  = Array.from(new TextEncoder().encode(json)).map((b) => b.toString(16).padStart(2, "0")).join("");
-  // Replace this VDXF id's array with a single entry; preserve other VDXF entries as-is
-  const newCm = { ...existing, [vdxfId]: [hex] };
-  // Stringify each existing array entry properly — getidentity returns objects; we need hex strings
-  for (const [k, v] of Object.entries(newCm)) {
-    if (k === vdxfId) continue;
-    newCm[k] = (Array.isArray(v) ? v : [v]).map((entry) => {
-      if (typeof entry === "string") return entry;
-      return entry?.serializedhex || entry?.message || JSON.stringify(entry);
-    });
-  }
+  const hex = encodeJsonToHex(payload);
+  const newCm = setMultimapEntries(existing, vdxfId, [hex], { fallbackToJson: true });
   const updateArg = {
     name,
     parent,
@@ -911,6 +516,22 @@ if (showStaleEl) {
   };
 }
 
+const LS_KEY_BACKGROUND_WRITES = "vl_background_writes";
+function backgroundWritesEnabled() {
+  return localStorage.getItem(LS_KEY_BACKGROUND_WRITES) === "1";
+}
+const backgroundWritesEl = document.getElementById("mp-background-writes");
+if (backgroundWritesEl) {
+  backgroundWritesEl.checked = backgroundWritesEnabled();
+  backgroundWritesEl.onchange = () => {
+    localStorage.setItem(LS_KEY_BACKGROUND_WRITES, backgroundWritesEl.checked ? "1" : "0");
+    if (backgroundWritesEl.checked) {
+      autoAcceptWatcher();
+      lenderHistoryWatcher();
+    }
+  };
+}
+
 // Two-level picker:
 //   R-address (your wallet root) → list of IDs under that R
 // If the chosen R has a single ID, the ID picker hides.
@@ -1026,6 +647,7 @@ const MARKET_CACHE_TTL_MS = 15000;
 // load, which 429s scan.verus.cx fast. Cache keyed by `address:state`.
 const _byPartyCache = new Map();
 async function fetchLoansByParty(address, state) {
+  if (!EXPLORER_API) return { results: [] };
   const key = `${address}:${state || 'all'}`;
   const slot = _byPartyCache.get(key);
   const now = Date.now();
@@ -1057,6 +679,7 @@ async function fetchLoansByParty(address, state) {
   finally { const s = _byPartyCache.get(key); if (s) s.inflight = null; }
 }
 async function fetchOneMarketTab(path) {
+  if (!EXPLORER_API) return { results: [] };
   const now = Date.now();
   let slot = _marketEndpointCache.get(path);
   if (slot && slot.data && (now - slot.at) < MARKET_CACHE_TTL_MS) {
@@ -1200,8 +823,17 @@ async function fetchMarketBundle() {
       const seeds = await getCounterpartyWatchList(ia).catch(() => []);
       for (const cp of seeds) if (!mySet.has(cp)) counterpartyIaddrs.add(cp);
     }
-    const VDXF_LOAN_MATCH_LOCAL = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
-    const VDXF_LOAN_REQUEST_LOCAL = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5";
+    // Local same-wallet discovery: when both test/counterparty IDs live in
+    // this daemon, there may be no explorer and no prior acting-side history
+    // to seed the watch list. Scanning other local spendable IDs is still
+    // daemon-only and only merges entries explicitly directed at the acting
+    // scope below.
+    const localIds = await ensureSpendableIds().catch(() => []);
+    for (const x of localIds) {
+      if (x?.iaddr && !mySet.has(x.iaddr)) counterpartyIaddrs.add(x.iaddr);
+    }
+    const seenOfferKeys = new Set((offRes.results || []).map((o) =>
+      `${o.iaddr}|${o.posted_tx || ""}`));
     const seenMatchKeys = new Set((mchRes.results || []).map((m) =>
       `${m.match_iaddr}|${m.tx_a_txid || m.request?.txid || ""}`));
     const seenReqKeys = new Set((reqRes.results || []).map((r) =>
@@ -1213,8 +845,30 @@ async function fetchMarketBundle() {
       const cm = info?.identity?.contentmultimap || {};
       const tipTxid = info?.txid;
       const fqn = info?.identity?.fullyqualifiedname || info?.identity?.name;
+      // Pull mempool-fresh loan.offer entries authored by this counterparty.
+      // This keeps offer-first discovery usable from the local daemon for
+      // known counterparties even when the public explorer is disabled.
+      for (const e of (cm[VDXF_LOAN_OFFER] || [])) {
+        const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+        if (!hex) continue;
+        try {
+          const j = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+          const key = `${cpIa}|${tipTxid || ""}`;
+          if (seenOfferKeys.has(key)) continue;
+          offRes.results = offRes.results || [];
+          offRes.results.push({
+            ...j,
+            iaddr: cpIa,
+            fullyQualifiedName: fqn,
+            name: info?.identity?.name,
+            posted_tx: tipTxid,
+            _mempool: true,
+          });
+          seenOfferKeys.add(key);
+        } catch {}
+      }
       // Pull mempool-fresh loan.match entries authored by this counterparty
-      for (const e of (cm[VDXF_LOAN_MATCH_LOCAL] || [])) {
+      for (const e of (cm[VDXF_LOAN_MATCH] || [])) {
         const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
         if (!hex) continue;
         try {
@@ -1236,7 +890,7 @@ async function fetchMarketBundle() {
         } catch {}
       }
       // Also pull mempool-fresh loan.request entries authored by this counterparty
-      for (const e of (cm[VDXF_LOAN_REQUEST_LOCAL] || [])) {
+      for (const e of (cm[VDXF_LOAN_REQUEST] || [])) {
         const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
         if (!hex) continue;
         try {
@@ -1306,6 +960,7 @@ async function fetchLoansBundleDaemon(myIaddrs) {
     .then((r) => r?.results || [])
     .catch(() => []);
   const ownOffResults = [];
+  const counterpartyOffResults = [];
 
   const decode = (e) => {
     const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
@@ -1349,6 +1004,14 @@ async function fetchLoansBundleDaemon(myIaddrs) {
     for (const cp of seeds) if (!mySet.has(cp)) counterparties.add(cp);
   }));
 
+  // Local same-wallet discovery for daemon-only mode. This lets a lender
+  // running one wallet see a borrower request posted from another local ID
+  // even before there is lender-side history or an external indexer result.
+  const localIds = await ensureSpendableIds().catch(() => []);
+  for (const x of localIds) {
+    if (x?.iaddr && !mySet.has(x.iaddr)) counterparties.add(x.iaddr);
+  }
+
   // 2. Walk each counterparty's multimap for entries directed at one of
   //    my iaddrs. mempool-aware (-1) so newly-posted entries surface
   //    before block confirmation.
@@ -1373,16 +1036,27 @@ async function fetchLoansBundleDaemon(myIaddrs) {
         mchResults.push({ ...j, match_iaddr: cpIa, fullyQualifiedName: fqn, name, posted_tx: tipTxid });
       }
     }
+    for (const e of (cm[VDXF_OFF] || [])) {
+      const j = decode(e); if (!j) continue;
+      counterpartyOffResults.push({ ...j, iaddr: cpIa, fullyQualifiedName: fqn, name, posted_tx: tipTxid });
+    }
   }));
 
   // Merge explorer offers + own-multimap offers (own-multimap wins on
   // dedup so my mempool-fresh own posts beat any stale explorer copy).
   const explorerOffers = await offResultsPromise;
   const ownIaddrs = new Set(ownOffResults.map((o) => o.iaddr));
-  const offResults = [
-    ...ownOffResults,
-    ...explorerOffers.filter((o) => !ownIaddrs.has(o.iaddr)),
-  ];
+  const seenOfferKeys = new Set();
+  const pushOffer = (out, offer) => {
+    const key = `${offer.iaddr}|${offer.posted_tx || ""}`;
+    if (seenOfferKeys.has(key)) return;
+    seenOfferKeys.add(key);
+    out.push(offer);
+  };
+  const offResults = [];
+  for (const o of ownOffResults) pushOffer(offResults, o);
+  for (const o of counterpartyOffResults) pushOffer(offResults, o);
+  for (const o of explorerOffers.filter((o) => !ownIaddrs.has(o.iaddr))) pushOffer(offResults, o);
 
   // Merge explorer-fetched requests/matches into the daemon-walked sets.
   // Daemon-walk is mempool-fresh for known counterparties, but for FIRST
@@ -1616,7 +1290,6 @@ async function loadMarket() {
     // via daemon (NOT /loans/by-party) so it catches orphan matches whose
     // request_txid points to a now-replaced version of the request.
     const matchedWithBorrowers = new Set();
-    const VDXF_LOAN_MATCH = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
     for (const ia of partyAddrs) {
       try {
         const info = await rpc("getidentity", [ia, -1]);
@@ -2073,6 +1746,7 @@ function _enrichSet(url, data) {
   _enrichCacheDirty = true;
 }
 async function fetchJsonWithRetry(url, { useCacheFirst = false } = {}) {
+  if (!url || url.startsWith("/contracts/") || url.startsWith("/identity/")) return null;
   // If cache-first: return cached immediately if present, fetch in background only on misses.
   if (useCacheFirst) {
     const cached = _enrichGet(url);
@@ -2169,7 +1843,7 @@ async function enrichMatchRowTerms(rowEl, r, token) {
   }
   // Stash the full resolved request keyed by matchKey so the Accept handler
   // can reuse it after subsequent loadMarket re-renders.
-  const mKey = `match-${r.match_iaddr}-${r.posted_tx || ""}`;
+  const mKey = `match-${r.match_iaddr}-${r.request?.iaddr || ""}`;
   matchResolvedRequest.set(mKey, req);
   // Stash currencies on the row so the balance enrichment can filter to
   // just the loan's currencies (collateral + repay for borrower; principal
@@ -2757,7 +2431,6 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       // signed Tx-A skeleton, so we have to read it directly).
       const borrowerInfo = await rpc("getidentity", [r.iaddr, -1]);
       try {
-        const VDXF_LOAN_REQUEST = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5";
         const cm = borrowerInfo?.identity?.contentmultimap || {};
         const entries = cm[VDXF_LOAN_REQUEST] || [];
         for (const e of entries) {
@@ -3153,22 +2826,46 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         expires_block:       matchExpiry,
         active: true,
       };
-      const payloadHex = Array.from(new TextEncoder().encode(JSON.stringify(match)))
-        .map((b) => b.toString(16).padStart(2, "0")).join("");
+      const payloadHex = encodeJsonToHex(match);
 
       // Read existing multimap entries on lender's identity to merge with our new one.
       const existing = (lenderInfoCache.get(acting) || (await rpc("getidentity", [acting, -1])).identity)?.contentmultimap || {};
-      const VDXF_LOAN_MATCH = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
-      const newMultimap = { ...existing };
-      // Normalize preserved entries to hex strings (defensive — see
-      // accept-v2 for context).
-      for (const [k, v] of Object.entries(newMultimap)) {
-        newMultimap[k] = (Array.isArray(v) ? v : [v]).map((entry) => {
-          if (typeof entry === "string") return entry;
-          return entry?.serializedhex || entry?.message || JSON.stringify(entry);
-        });
+      const newMultimap = normalizeContentMultimap(existing, { fallbackToJson: true });
+      const priorMatches = newMultimap[VDXF_LOAN_MATCH] || [];
+      const keptMatches = [];
+      for (const hex of priorMatches) {
+        try {
+          const j = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+          const duplicate = j?.request?.txid === match.request.txid || j?.tx_a_txid === match.tx_a_txid;
+          if (duplicate) continue;
+
+          // Full loan.match payloads are large. Keep live pending/active
+          // matches, but prune ones whose borrower has already posted a
+          // terminal loan.history entry. Historical revisions still retain
+          // the old match, and live state stays under identity script limits.
+          let settled = false;
+          if (j?.request?.iaddr && (j?.tx_a_txid || j?.request?.txid)) {
+            const borrowerInfo = await rpc("getidentity", [j.request.iaddr, -1]).catch(() => null);
+            const histories = borrowerInfo?.identity?.contentmultimap?.[VDXF_LOAN_HISTORY] || [];
+            for (const he of histories) {
+              const hhex = typeof he === "string" ? he : (he?.serializedhex || he?.message || "");
+              if (!hhex) continue;
+              try {
+                const h = JSON.parse(new TextDecoder().decode(_hexToBytes(hhex)));
+                if ((j.tx_a_txid && h.loan_id === j.tx_a_txid) ||
+                    (j.request?.txid && h.request_txid === j.request.txid)) {
+                  settled = true;
+                  break;
+                }
+              } catch {}
+            }
+          }
+          if (!settled) keptMatches.push(hex);
+        } catch {
+          keptMatches.push(hex);
+        }
       }
-      newMultimap[VDXF_LOAN_MATCH] = [payloadHex];
+      newMultimap[VDXF_LOAN_MATCH] = [...keptMatches, payloadHex];
 
       const updateTxid = await rpc("updateidentity", [{
         name: ds.actingName,
@@ -3216,10 +2913,16 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     panel.style.display = "block";
     panel.dataset.opActive = "1";   // marker so loadMarket can skip clobbering
     panel.innerHTML = `<div class="review muted">looking up request terms…</div>`;
-    // Reuse what enrichMatchRowTerms already resolved if present — saves a
-    // round-trip and keeps Accept usable when the explorer is rate-limiting.
-    let req = matchResolvedRequest.get(matchKey) || null;
+    // Show daemon-resolved terms when possible. Explorer/cache data is only
+    // a display fallback; accept-v2 re-fetches from daemon before signing.
+    let req = null;
     try {
+      if (r.request?.txid) {
+        try { req = await fetchRequestFromLocalDaemon(r.request.txid); } catch {}
+      }
+      if (!req) {
+        req = matchResolvedRequest.get(matchKey) || null;
+      }
       if (!req) {
         const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
         if (cur) req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
@@ -3232,17 +2935,12 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           if (p) req = { principal: p.principal, collateral: p.collateral, repay: p.repay, term_days: p.term_days };
         }
       }
-      // Local daemon fallback — works without the explorer.
-      if (!req && r.request?.txid) {
-        try { req = await fetchRequestFromLocalDaemon(r.request.txid); } catch {}
-      }
     } catch {}
     if (req) matchResolvedRequest.set(matchKey, req);
     // Explorer strips v2-only fields like tx_a_full. Re-fetch the raw match
     // multimap entry from the lender's iaddr so we know which UI flow to show.
     try {
       const lenderInfo = await rpc("getidentity", [r.match_iaddr, -1]);
-      const VDXF_LOAN_MATCH = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
       const cm = lenderInfo?.identity?.contentmultimap || {};
       const entries = cm[VDXF_LOAN_MATCH] || [];
       for (const e of entries) {
@@ -3302,7 +3000,6 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       // Re-fetch the raw multimap entry from the lender's iaddr to get them.
       try {
         const lenderInfo = await rpc("getidentity", [r.match_iaddr, -1]);
-        const VDXF_LOAN_MATCH = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
         const cm = lenderInfo?.identity?.contentmultimap || {};
         const entries = cm[VDXF_LOAN_MATCH] || [];
         for (const e of entries) {
@@ -3360,11 +3057,8 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           }
         } catch {}
       }
-      if (!_req) {
-        // Last resort — fall back to the cache if it exists.
-        _req = matchResolvedRequest.get(matchKey);
-      }
       if (!_req) throw new Error("can't verify match — original request payload not found");
+      matchResolvedRequest.set(matchKey, _req);
       const safetyErrors = await verifyMatchSafety(r, _req, acting);
       if (safetyErrors.length > 0) {
         throw new Error("Match safety check failed:\n  • " + safetyErrors.join("\n  • "));
@@ -3393,7 +3087,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       try { await rpc("addmultisigaddress", [2, [pubA, pubB]]); } catch {}
 
       // Build prevtxs hint for the vault input (used by both Tx-Repay and Tx-B sigs).
-      const req = matchResolvedRequest.get(matchKey) || (r.request?.txid ? await fetchRequestFromLocalDaemon(r.request.txid).catch(() => null) : null);
+      const req = _req;
       if (!req?.collateral?.amount) throw new Error("collateral amount missing — refresh the marketplace and retry");
       const collateralAmt = parseFloat(req.collateral.amount);
       const prevtxsHint = [{
@@ -3429,7 +3123,6 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       btn.textContent = "Posting Tx-B + loan.status to your VerusID…";
       const idInfo = await rpc("getidentity", [acting, -1]);
       const existing = idInfo?.identity?.contentmultimap || {};
-      const VDXF_LOAN_STATUS = "iRzM96sNYj95mUiJebzBnFwirjfws2q6o4";
       const statusPayload = {
         version: 3,
         role: "borrower",
@@ -3457,28 +3150,17 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         tx_repay_signed: repaySigned.hex,
         active: true,
       };
-      const statusHex = Array.from(new TextEncoder().encode(JSON.stringify(statusPayload)))
-        .map((b) => b.toString(16).padStart(2, "0")).join("");
+      const statusHex = encodeJsonToHex(statusPayload);
       // Build newCm from scratch — only valid i-address keys with valid
       // hex entries. Anything else trips daemon's "Invalid JSON ID
       // parameter".
-      const newCm = {};
-      const isHex = (s) => typeof s === "string" && s.length > 0 && s.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(s);
-      const isIaddr = (k) => typeof k === "string" && /^i[1-9A-HJ-NP-Za-km-z]{33}$/.test(k);
-      for (const [k, v] of Object.entries(existing)) {
-        if (!isIaddr(k)) continue;
-        const entries = (Array.isArray(v) ? v : [v])
-          .map((entry) => typeof entry === "string" ? entry : (entry?.serializedhex || entry?.message || ""))
-          .filter(isHex);
-        if (entries.length) newCm[k] = entries;
-      }
+      const newCm = normalizeContentMultimap(existing, { requireIaddrKeys: true, requireHex: true });
       newCm[VDXF_LOAN_STATUS] = [...(newCm[VDXF_LOAN_STATUS] || []), statusHex];
       // Consume the loan.request: this updateidentity is the moment the
       // request transitions from "intent" to "active loan." Dropping the
       // entry atomically with adding loan.status keeps the borrower's
       // multimap reflecting current truth and removes the stale request
       // from lender-side discovery views.
-      const VDXF_LOAN_REQUEST = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5";
       delete newCm[VDXF_LOAN_REQUEST];
       // Diag: log the exact payload shape being sent. Helps debug
       // "Invalid JSON ID parameter" errors from the daemon.
@@ -3488,7 +3170,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       // Validate every entry hex one more time and log invalid ones.
       for (const [k, arr] of Object.entries(newCm)) {
         for (const e of arr) {
-          if (typeof e !== "string" || !/^[0-9a-fA-F]+$/.test(e)) {
+          if (!isHexString(e)) {
             console.warn(`[accept-v2] INVALID entry under key ${k}: type=${typeof e} val=${JSON.stringify(e)?.slice(0,100)}`);
           }
         }
@@ -3540,66 +3222,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     const resultEl = panel.querySelector(".accept-result") || panel;
     btn.disabled = true; btn.textContent = "Building Tx-A…";
     try {
-      // Reuse the already-resolved request if available.
-      let req = matchResolvedRequest.get(matchKey) || null;
-      if (!req) {
-        const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
-        if (cur) req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
-      }
-      if (!req) {
-        const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
-        const ev = (hist?.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid) || (hist?.results || [])[0];
-        const p = ev?.entries?.[0]?.decoded;
-        if (p) req = p;
-      }
-      if (!req) throw new Error("can't find linked request — terms unknown");
-      const acting = actingIaddr();
-      if (!acting || acting === "all") throw new Error("select your borrower identity in the picker first");
-      // Resolve borrower R-address.
-      const idInfo = await rpc("getidentity", [acting, -1]);
-      const borrowerR = (idInfo?.identity?.primaryaddresses || [])[0];
-      if (!borrowerR) throw new Error("borrower identity has no primary R-address");
-
-      // Find a UTXO at borrower R that covers collateral + fee.
-      const collCcy = req.collateral?.currency;
-      const collAmt = parseFloat(req.collateral?.amount ?? 0);
-      if (!collAmt) throw new Error("collateral amount missing in request");
-      const FEE = 0.0001;
-      const utxos = await rpc("getaddressutxos", [{ addresses: [borrowerR], currencynames: true }]);
-      // For VRSC collateral, pick a P2PKH UTXO whose VRSC value >= collateral + fee.
-      let chosenUtxo = null;
-      if (collCcy === "VRSC" || collCcy === "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV") {
-        chosenUtxo = utxos
-          .filter((u) => u.satoshis >= Math.round((collAmt + FEE) * 1e8))
-          .sort((a, b) => a.satoshis - b.satoshis)[0];
-        if (!chosenUtxo) throw new Error(`no VRSC UTXO at ${borrowerR} covers ${collAmt + FEE} VRSC`);
-      } else {
-        throw new Error(`borrower-side accept for ${collCcy} collateral not wired yet (only VRSC for now)`);
-      }
-      const inputSats = chosenUtxo.satoshis;
-      const collSats = Math.round(collAmt * 1e8);
-      const changeSats = inputSats - collSats - Math.round(FEE * 1e8);
-      if (changeSats < 0) throw new Error(`UTXO ${chosenUtxo.txid}:${chosenUtxo.outputIndex} too small`);
-
-      btn.textContent = "Extending pre-signed Tx-A…";
-      const extendedHex = extendPresignedLoanTxA({
-        presignedHex: r.tx_a_partial,
-        borrowerInputTxid: chosenUtxo.txid,
-        borrowerInputVout: chosenUtxo.outputIndex,
-        vaultP2sh: r.vault_address,
-        collateralSats: collSats,
-        borrowerChangeAddr: borrowerR,
-        borrowerChangeSats: changeSats,
-      });
-
-      btn.textContent = "Signing your input…";
-      const signed = await rpc("signrawtransaction", [extendedHex]);
-      if (!signed.complete) throw new Error("signing did not complete: " + JSON.stringify(signed.errors || {}));
-
-      btn.textContent = "Broadcasting…";
-      const txid = await rpc("sendrawtransaction", [signed.hex]);
-      resultEl.innerHTML = `<div class="muted" style="color:var(--ok)">✓ Tx-A broadcast: <a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(txid)}" target="_blank"><code>${escapeHtml(txid)}</code></a></div>`;
-      btn.style.display = "none";
+      throw new Error("legacy v1 accept is disabled in this build; ask the lender to repost a v2 match");
     } catch (e) {
       resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
       btn.disabled = false;
@@ -3624,14 +3247,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       for (const oldEntry of (cm[vdxfId] || [])) {
         await unlockEntryUtxos(vdxfId, oldEntry);
       }
-      const newCm = {};
-      for (const [k, v] of Object.entries(cm)) {
-        if (k === vdxfId) continue;
-        newCm[k] = (Array.isArray(v) ? v : [v]).map((entry) => {
-          if (typeof entry === "string") return entry;
-          return entry?.serializedhex || entry?.message || JSON.stringify(entry);
-        });
-      }
+      const newCm = dropMultimapKey(cm, vdxfId, { fallbackToJson: true });
       const txid = await rpc("updateidentity", [{ name, parent, contentmultimap: newCm }]);
       btn.textContent = `✓ ${txid.slice(0, 10)}…`;
       setTimeout(() => { loadMarket(); loadIdentities(); }, 3000);
@@ -3663,8 +3279,6 @@ async function unlockEntryUtxos(vdxfId, entry) {
     const hex = typeof entry === "string" ? entry : (entry?.serializedhex || entry?.message || "");
     if (!hex) return;
     const payload = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
-    const VDXF_LOAN_REQUEST = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5";
-    const VDXF_LOAN_MATCH   = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
     const txHex = vdxfId === VDXF_LOAN_REQUEST ? payload.borrower_input_signed_hex
                 : vdxfId === VDXF_LOAN_MATCH   ? payload.tx_a_full
                 : null;
@@ -3714,24 +3328,6 @@ async function balanceFor(iaddr) {
   } catch {
     return { iaddrBalance: {}, rBalance: {}, primaryR: null };
   }
-}
-
-function fmtBalances(bal, currencyMap = {}) {
-  // bal is { currency_id_or_name: amount }. Map known IDs to names.
-  const KNOWN_IDS = {
-    "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV": "VRSC",
-    "iGBs4DWztRNvNEJBt4mqHszLxfKTNHTkhM": "DAI.vETH",
-    "iCkKJuJScy4Z6NSDK7Mt42ZAB2NEnAE1o4": "vETH",
-    "iJ3WZocnjG9ufv7GKUA4LijQno5gTMb7tP": "CHIPS",
-    "iExBJfZYK7KREDpuhj6PzZBzqMAKaFg7d2": "vARRR",
-    "iHog9UCTrn95qpUBFCZ7kKz7qWdMA8MQ6N": "vDEX",
-  };
-  const items = [];
-  for (const [k, v] of Object.entries(bal || {})) {
-    const name = KNOWN_IDS[k] || currencyMap[k] || k;
-    if (parseFloat(v) > 0) items.push(`${parseFloat(v)} ${name}`);
-  }
-  return items.length ? items.join(" · ") : "—";
 }
 
 async function openMarketPostForm(kind, prefill) {
@@ -3811,23 +3407,6 @@ async function renderActingInfo(me) {
     formEl.addEventListener("input", () => runFormValidation(formEl));
     formEl.addEventListener("change", () => runFormValidation(formEl));
   }
-}
-
-// Map currency names → their canonical iaddr key in getaddressbalance results.
-const CURRENCY_NAME_TO_IADDR = {
-  "VRSC":     "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV",
-  "DAI.vETH": "iGBs4DWztRNvNEJBt4mqHszLxfKTNHTkhM",
-  "vETH":     "iCkKJuJScy4Z6NSDK7Mt42ZAB2NEnAE1o4",
-  "CHIPS":    "iJ3WZocnjG9ufv7GKUA4LijQno5gTMb7tP",
-};
-function _balanceForCurrency(rBalance, currencyName) {
-  if (!rBalance) return 0;
-  // rBalance keys are i-addresses; map back via CURRENCY_NAME_TO_IADDR.
-  const iaddrKey = CURRENCY_NAME_TO_IADDR[currencyName];
-  if (iaddrKey != null && rBalance[iaddrKey] != null) return parseFloat(rBalance[iaddrKey]);
-  // Fallback: maybe the key is already the name.
-  if (rBalance[currencyName] != null) return parseFloat(rBalance[currencyName]);
-  return 0;
 }
 
 // Form validation runs on every input change. Three checks per form:
@@ -4302,16 +3881,8 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
   // Merge with existing entries
   let existing = {};
   try { existing = (await rpc("getidentity", [iaddr, -1]))?.identity?.contentmultimap || {}; } catch {}
-  const json = JSON.stringify(payload);
-  const hex  = Array.from(new TextEncoder().encode(json)).map((b) => b.toString(16).padStart(2, "0")).join("");
-  const newCm = { ...existing, [vdxfId]: [hex] };
-  for (const [k, v] of Object.entries(newCm)) {
-    if (k === vdxfId) continue;
-    newCm[k] = (Array.isArray(v) ? v : [v]).map((entry) => {
-      if (typeof entry === "string") return entry;
-      return entry?.serializedhex || entry?.message || JSON.stringify(entry);
-    });
-  }
+  const hex = encodeJsonToHex(payload);
+  const newCm = setMultimapEntries(existing, vdxfId, [hex], { fallbackToJson: true });
   const updateArg = { name, parent, contentmultimap: newCm };
   pendingMarketBroadcast = updateArg;
   const cmd = `verus updateidentity '${JSON.stringify(updateArg)}'`;
@@ -4343,11 +3914,6 @@ let pendingMarketBroadcast = null;
 // explorer API.
 async function fetchActiveLoansFromDaemon(actingIa) {
   if (!actingIa || actingIa === "all") return [];
-  const VDXF_LOAN_REQUEST = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5";
-  const VDXF_LOAN_MATCH   = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
-  const VDXF_LOAN_STATUS  = "iRzM96sNYj95mUiJebzBnFwirjfws2q6o4";
-  const VDXF_LOAN_HISTORY = "i5qBwi3KWXfyo1UKuUBC3yyq67JagVennW";
-
   const decode = (e) => {
     const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
     if (!hex) return null;
@@ -4497,7 +4063,6 @@ async function loadLoans(targetEl) {
     let info;
     try { info = await rpc("getidentity", [ia, -1]); } catch { continue; }
     const cm = info?.identity?.contentmultimap || {};
-    const VDXF_LOAN_STATUS = "iRzM96sNYj95mUiJebzBnFwirjfws2q6o4";
     for (const e of (cm[VDXF_LOAN_STATUS] || [])) {
       const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
       if (!hex) continue;
@@ -4732,11 +4297,12 @@ async function enrichActiveLoanBalances() {
       if (!acting || acting === "all") throw new Error("set acting identity first");
       const idInfo = await rpc("getidentity", [acting, -1]);
       const existing = idInfo?.identity?.contentmultimap || {};
-      const VDXF_LOAN_MATCH = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
       const counterpartyIa = btn.dataset.counterpartyIaddr || "";
-      // Drop any active match where request.iaddr matches the borrower
-      // we're cancelling against. Other matches (different borrowers)
-      // are preserved.
+      const targetLoanId = loanId || "";
+      // Drop the specific match represented by this row. Older builds
+      // matched only on borrower iaddr, which can delete unrelated prior
+      // matches for the same borrower. Prefer the stable Tx-A/loan id and
+      // fall back to borrower iaddr only for legacy rows without an id.
       const newCm = { ...existing };
       const allEntries = newCm[VDXF_LOAN_MATCH] || [];
       const kept = [];
@@ -4746,7 +4312,9 @@ async function enrichActiveLoanBalances() {
         let toCancel = false;
         try {
           const j = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
-          toCancel = j?.request?.iaddr === counterpartyIa;
+          toCancel = targetLoanId
+            ? (j?.tx_a_txid === targetLoanId || j?.loan_id === targetLoanId)
+            : (j?.request?.iaddr === counterpartyIa);
         } catch {}
         if (toCancel) {
           // Release the lender's principal funding UTXO so the wallet can
@@ -4799,7 +4367,6 @@ async function enrichActiveLoanBalances() {
       const acting = actingIaddr();
       const idInfo = await rpc("getidentity", [acting, -1]);
       const cm = idInfo?.identity?.contentmultimap || {};
-      const VDXF_LOAN_STATUS = "iRzM96sNYj95mUiJebzBnFwirjfws2q6o4";
       let status = null;
       for (const e of (cm[VDXF_LOAN_STATUS] || [])) {
         const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
@@ -4863,7 +4430,6 @@ async function enrichActiveLoanBalances() {
         btn.textContent = "Recovering Tx-Repay from lender's loan.match…";
         const lenderIa = status.match_iaddr;
         if (!lenderIa) throw new Error("loan.status missing match_iaddr — can't recover Tx-Repay from chain");
-        const VDXF_LOAN_MATCH = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
         let matchPayload = null;
         // Tier 3: current state.
         const lenderInfo = await rpc("getidentity", [lenderIa, -1]);
@@ -5022,7 +4588,6 @@ async function enrichActiveLoanBalances() {
 
       // Post loan.history (settled = repaid) on borrower's identity for trade-history
       btn.textContent = "Posting loan.history (settled)…";
-      const VDXF_LOAN_HISTORY = "i5qBwi3KWXfyo1UKuUBC3yyq67JagVennW";
       const historyPayload = {
         version: 3,
         role: "borrower",
@@ -5046,22 +4611,16 @@ async function enrichActiveLoanBalances() {
         posted_block: status.posted_block ?? status.originated_block ?? null,
         counterparty_iaddr: status.match_iaddr,
       };
-      const historyHex = Array.from(new TextEncoder().encode(JSON.stringify(historyPayload)))
-        .map((b) => b.toString(16).padStart(2, "0")).join("");
+      const historyHex = encodeJsonToHex(historyPayload);
       // Re-fetch the borrower's CURRENT identity right before posting. The
       // multimap may have changed since the start of the repay handler
       // (other concurrent updateidentity, etc.), and updateidentity will
       // 500 if our `cm` is stale.
       const freshIdInfo = await rpc("getidentity", [acting, -1]);
       const freshCm = freshIdInfo?.identity?.contentmultimap || {};
-      const newCm = {};
       // Normalize every existing entry to a plain hex string — daemon
       // rejects mixed shapes (some plain hex, some {serializedhex: "..."}).
-      for (const [k, arr] of Object.entries(freshCm)) {
-        newCm[k] = (Array.isArray(arr) ? arr : [arr])
-          .map((entry) => typeof entry === "string" ? entry : (entry?.serializedhex || entry?.message || ""))
-          .filter(Boolean);
-      }
+      const newCm = normalizeContentMultimap(freshCm);
       // Always overwrite to size 1 — the live multimap holds the most-recent
       // settlement event as a public beacon. Older entries persist forever in
       // prior identity revisions (getidentityhistory) and the local cache
@@ -5787,13 +5346,10 @@ setInterval(refreshStatus, 15000);
 // is excluded by verifyMatchSafety's vault input check).
 const _autoAcceptInFlight = new Set();
 async function autoAcceptWatcher() {
+  if (!backgroundWritesEnabled()) return;
   try {
     const myIaddrs = await inScopeIaddrs();
     if (myIaddrs.length === 0) return;
-    const VDXF_LOAN_REQUEST = "iF7Ax6QpdwvTTqDJpNzDXVj1GpUSQX6vH5";
-    const VDXF_LOAN_MATCH   = "iKVShS5o56BLn8BpysrmfvUJbWCrgyio8U";
-    const VDXF_LOAN_STATUS  = "iRzM96sNYj95mUiJebzBnFwirjfws2q6o4";
-
     for (const ia of myIaddrs) {
       const info = await rpc("getidentity", [ia, -1]).catch(() => null);
       const cm = info?.identity?.contentmultimap || {};
@@ -5978,14 +5534,8 @@ async function postHistoryEntry(iaddr, payload) {
   const ident = idInfo?.identity;
   if (!ident) throw new Error(`getidentity returned no identity for ${iaddr}`);
   const cm = ident.contentmultimap || {};
-  const newCm = {};
-  for (const [k, arr] of Object.entries(cm)) {
-    newCm[k] = (Array.isArray(arr) ? arr : [arr])
-      .map((e) => typeof e === "string" ? e : (e?.serializedhex || e?.message || ""))
-      .filter(Boolean);
-  }
-  const hex = Array.from(new TextEncoder().encode(JSON.stringify(payload)))
-    .map((b) => b.toString(16).padStart(2, "0")).join("");
+  const newCm = normalizeContentMultimap(cm);
+  const hex = encodeJsonToHex(payload);
   newCm[VDXF_LOAN_HISTORY] = [hex];   // always-1 overwrite
   // Drop the loan.match entry for this loan_id (if present). Safe to no-op
   // when we're not the lender (borrower has no loan.match entries).
@@ -6015,14 +5565,8 @@ async function postDeclineEntry(iaddr, payload) {
   const ident = idInfo?.identity;
   if (!ident) throw new Error(`getidentity returned no identity for ${iaddr}`);
   const cm = ident.contentmultimap || {};
-  const newCm = {};
-  for (const [k, arr] of Object.entries(cm)) {
-    newCm[k] = (Array.isArray(arr) ? arr : [arr])
-      .map((e) => typeof e === "string" ? e : (e?.serializedhex || e?.message || ""))
-      .filter(Boolean);
-  }
-  const hex = Array.from(new TextEncoder().encode(JSON.stringify(payload)))
-    .map((b) => b.toString(16).padStart(2, "0")).join("");
+  const newCm = normalizeContentMultimap(cm);
+  const hex = encodeJsonToHex(payload);
   newCm[VDXF_LOAN_DECLINE] = [hex];
   return await rpc("updateidentity", [{
     name: ident.name,
@@ -6075,30 +5619,48 @@ async function findVaultSpendingTx(vault_address, tx_a_txid) {
 //   - One output to lender's R w/ amount ≈ repay → repaid (Tx-Repay)
 //   - One output to lender's R w/ amount ≈ collateral → defaulted (Tx-B)
 //   - Cooperative drain, complex structure → cancelled (Tx-C / manual)
-function classifyOutcome(spendingTx, match) {
+function _outputAmountForCurrency(vout, currency) {
+  if (!vout) return 0;
+  if (!currency || currency === "VRSC" || currency === "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV") {
+    if (Number.isFinite(vout.value)) return parseFloat(vout.value);
+    if (Number.isFinite(vout.valueSat)) return vout.valueSat / 1e8;
+    return 0;
+  }
+  const values =
+    vout?.scriptPubKey?.reserveoutput?.currencyvalues ||
+    vout?.scriptPubKey?.reservetransfer?.currencyvalues ||
+    vout?.currencyvalues ||
+    {};
+  if (values[currency] != null) return parseFloat(values[currency]);
+  const vals = Object.values(values);
+  return vals.length === 1 ? parseFloat(vals[0]) : 0;
+}
+
+function _amountClose(actual, expected) {
+  if (!Number.isFinite(actual) || !Number.isFinite(expected) || expected <= 0) return false;
+  return Math.abs(actual - expected) < 0.0000001;
+}
+
+function classifyOutcome(spendingTx, match, requestTerms = null) {
   const vouts = spendingTx?.vout || [];
   const lenderR = match.lender_address;
-  const repayAmt = parseFloat(match.request?.repay?.amount ?? 0);
-  const collatAmt = parseFloat(match.request?.collateral?.amount ?? 0);
+  const terms = requestTerms || match.request_terms || match.terms || match;
+  const repayCcy = terms?.repay?.currency;
+  const collatCcy = terms?.collateral?.currency;
+  const repayAmt = parseFloat(terms?.repay?.amount ?? 0);
+  const collatAmt = parseFloat(terms?.collateral?.amount ?? 0);
 
   for (const v of vouts) {
     const addrs = v?.scriptPubKey?.addresses || [];
     if (!addrs.includes(lenderR)) continue;
-    const valNative = parseFloat(v.value || 0);
-    const valCcy = (() => {
-      const cv = v?.scriptPubKey?.reservetransfer || v?.valueSat || null;
-      // Verus cross-currency outputs may carry currencyvalues — best-effort
-      const cvs = v?.currencyvalues || {};
-      for (const amt of Object.values(cvs)) return parseFloat(amt);
-      return valNative;
-    })();
-    if (Math.abs(valCcy - repayAmt) < 0.01) return "repaid";
-    if (Math.abs(valCcy - collatAmt) < 0.01) return "defaulted";
+    if (_amountClose(_outputAmountForCurrency(v, repayCcy), repayAmt)) return "repaid";
+    if (_amountClose(_outputAmountForCurrency(v, collatCcy), collatAmt)) return "defaulted";
   }
   return "unknown";
 }
 
 async function lenderHistoryWatcher() {
+  if (!backgroundWritesEnabled()) return;
   await loadAttestations();
   try {
     const myIaddrs = await inScopeIaddrs();
@@ -6129,7 +5691,20 @@ async function lenderHistoryWatcher() {
         // Confirmation gate: don't attest mempool-only spends
         const confs = spent.raw?.confirmations ?? 0;
         if (confs < 1) continue;
-        const outcome = classifyOutcome(spent.raw, match);
+        let requestTerms = null;
+        if (match.request?.txid) {
+          requestTerms = await fetchRequestFromLocalDaemon(match.request.txid).catch(() => null);
+        }
+        if (!requestTerms) {
+          // Future-compatible fallback for match payloads that embed terms.
+          requestTerms = {
+            principal: match.principal || match.request?.principal,
+            collateral: match.collateral || match.request?.collateral,
+            repay: match.repay || match.request?.repay,
+            term_days: match.term_days ?? match.request?.term_days ?? null,
+          };
+        }
+        const outcome = classifyOutcome(spent.raw, match, requestTerms);
         if (outcome === "unknown") {
           console.warn(`[lender-history] couldn't classify ${spent.txid} for loan ${loanId.slice(0,12)} — skipping`);
           continue;
@@ -6142,10 +5717,10 @@ async function lenderHistoryWatcher() {
           outcome,                                  // repaid | defaulted | cancelled
           [outcome === "repaid" ? "tx_repay_txid" : "outcome_tx"]: spent.txid,
           settled_at_block: spent.blockheight,
-          principal: match.request?.principal,
-          collateral: match.request?.collateral,
-          repay: match.request?.repay,
-          term_days: match.request?.term_days ?? null,
+          principal: requestTerms?.principal,
+          collateral: requestTerms?.collateral,
+          repay: requestTerms?.repay,
+          term_days: requestTerms?.term_days ?? null,
           maturity_block: match.maturity_block ?? null,
           counterparty_iaddr: match.request?.iaddr,
         };
